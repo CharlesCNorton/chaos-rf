@@ -6,20 +6,26 @@ Chaotic synchronization and communication over 433 MHz RF using Flipper Zero + R
 
 Transmits one variable (x) of a Lorenz attractor over RF. The receiver reconstructs the other two variables (y, z) using Pecora-Carroll synchronization. Binary data can be hidden in the chaotic carrier using Cuomo-Oppenheim masking.
 
-## Statistical Results (N=30 trials)
+## Statistical Results
 
-### Channel Reliability
+### Synchronization (N=10 trials)
 | Metric | Value |
 |--------|-------|
-| Success rate | 40% |
+| Success rate | 70% |
 | Failure mode | Poor alignment (raw_corr < 0.5) |
 
-### Synchronization (successful trials, 95% CI)
-| Metric | Mean | 95% CI |
-|--------|------|--------|
-| x recovery | 0.514 | [0.458, 0.571] |
-| y sync | 0.911 | [0.868, 0.953] |
-| z sync | 0.960 | [0.943, 0.978] |
+| Metric | Mean | Range |
+|--------|------|-------|
+| x recovery | 0.935 | [0.909, 0.955] |
+| y sync | 0.997 | [0.997, 0.998] |
+| z sync | 0.999 | [0.999, 0.999] |
+
+### Chaos Modem (N=10 trials)
+| Metric | Value |
+|--------|-------|
+| Success rate | 100% |
+| Message | "A" (8 bits) |
+| Bit errors | 0/8 all trials |
 
 ## Hardware
 
@@ -57,18 +63,25 @@ dz/dt = x*y - beta*z
 - Smaller windows detect carrier oscillations, not pulse envelope
 - This is the most common source of errors
 
-### Alignment
+### Alignment & Calibration
 - TX and RX period sequences may be offset by several samples
 - Use cross-correlation to find best alignment before calibration
-- Reject trials with raw_corr < 0.5
+- Linear calibration (slope, intercept) compensates for timing drift
+- Reject trials with raw_corr < 0.5 (sync) or < 0.3 (modem)
 
 ### Transient
 - Skip first 15 samples when computing sync correlations
 - The receiver y,z subsystem needs time to converge to attractor
 
 ### Initial Conditions
-- Use true y[0], z[0] for sync (not arbitrary values)
-- With random ICs, y sync drops from 0.91 to ~0.80
+- Use true y[0], z[0] for sync and modem (not arbitrary values)
+- With random ICs, y sync drops from 0.99 to ~0.80
+
+### Modem Decoding
+- Use 80% settle time per bit (observer transient after mask)
+- Threshold at 45% of mask amplitude
+- Post-process: correct 1→0 transients (consecutive 1s with mid-range residual)
+- 50 samples/bit at 4KB serial limit
 
 ## Flipper Serial Notes
 

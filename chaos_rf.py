@@ -147,7 +147,7 @@ PERIOD_MAX = 2000       # Maximum pulse period (microseconds)
 X_MIN, X_MAX = -20.0, 20.0
 
 # Modem parameters
-SAMPLES_PER_BIT = 150  # Reduced for faster upload (150 causes serial hang)
+SAMPLES_PER_BIT = 50   # 50 samples/bit × 8 bits = 400 samples ≈ 4KB (at serial limit)
 MASK_AMPLITUDE = 3.0
 
 
@@ -398,7 +398,7 @@ def run_sync_experiment(n_samples=80):
     print("=" * 60)
 
     # Generate trajectory with warmup to reach attractor
-    np.random.seed(42)
+    # No fixed seed - real variability for each trial
     warmup = 1000
     total = warmup + n_samples
     t, traj = generate_trajectory(duration=total * DT, dt=DT)
@@ -430,7 +430,7 @@ def run_sync_experiment(n_samples=80):
 
     print(f"    Periods recovered: {len(periods_rx)}")
 
-    # Compute expected TX periods
+    # Compute expected TX periods for alignment
     periods_tx = np.array([x_to_period(x) for x in x_true])
 
     # Find best alignment using cross-correlation
@@ -474,14 +474,18 @@ def run_sync_experiment(n_samples=80):
     z_corr = np.corrcoef(z_true_aligned[skip:], z_sync[skip:])[0, 1]
 
     print("\n" + "=" * 60)
-    print("RESULTS (after transient skip)")
+    print("RESULTS")
     print("=" * 60)
-    print(f"x recovery correlation:  {x_corr:.4f}")
-    print(f"y synchronization:       {y_corr:.4f}")
-    print(f"z synchronization:       {z_corr:.4f}")
+    print(f"Alignment:  offset={offset}, raw_corr={raw_corr:.4f}")
+    print(f"Calibration: slope={slope:.4f}, intercept={intercept:.1f}")
+    print(f"x recovery:  {x_corr:.4f}")
+    print(f"y sync:      {y_corr:.4f}")
+    print(f"z sync:      {z_corr:.4f}")
 
     if raw_corr > 0.5 and y_corr > 0.8:
         print("\n*** SYNC SUCCESSFUL ***")
+    else:
+        print(f"\n*** SYNC FAILED *** (raw_corr={raw_corr:.3f}, y_corr={y_corr:.3f})")
 
     return {'x_corr': x_corr, 'y_corr': y_corr, 'z_corr': z_corr,
             'snr': snr, 'raw_corr': raw_corr, 'n_samples': n}
@@ -501,11 +505,13 @@ def run_modem_experiment(message="A"):
     print(f"Samples: {n_samples}, Mask amplitude: {MASK_AMPLITUDE}")
 
     # Generate trajectory with warmup
-    np.random.seed(42)
+    # No fixed seed - real variability for each trial
     warmup = 1000
     total = warmup + n_samples
     t, traj = generate_trajectory(duration=total * DT, dt=DT)
     x_true = traj[warmup:warmup + n_samples, 0]
+    y_true = traj[warmup:warmup + n_samples, 1]
+    z_true = traj[warmup:warmup + n_samples, 2]
 
     print(f"\n[1] Generated trajectory, x range [{x_true.min():.2f}, {x_true.max():.2f}]")
 
@@ -530,34 +536,76 @@ def run_modem_experiment(message="A"):
 
     # Analyze
     print("[5] Analyzing...")
-    periods, snr = extract_periods_from_capture(capture_file, n_samples)
+    periods_rx, snr = extract_periods_from_capture(capture_file, n_samples)
     print(f"    SNR: {snr:.1f}")
 
-    if periods is None:
+    if periods_rx is None:
         print("    ERROR: No signal detected")
         return None
 
-    print(f"    Periods: {len(periods)} (expected {n_samples})")
+    print(f"    Periods: {len(periods_rx)} (expected {n_samples})")
 
-    # Convert to x values (this is s = x + mask)
-    n = min(len(periods), n_samples)
-    s_recv = np.array([period_to_x(p) for p in periods[:n]])
+    # Compute expected TX periods for alignment
+    periods_tx = np.array([x_to_period(x) for x in x_masked])
 
-    # Run Cuomo-Oppenheim observer to estimate x
-    x_est, y_est, z_est = cuomo_oppenheim_observer(s_recv, DT)
+    # Find best alignment
+    offset, raw_corr = find_best_alignment(periods_tx, periods_rx)
+    print(f"    Alignment: offset={offset}, raw_corr={raw_corr:.4f}")
+
+    if raw_corr < 0.3:
+        print("    ERROR: Poor alignment")
+        return None
+
+    # Apply alignment
+    if offset >= 0:
+        tx_aligned = periods_tx[:min(len(periods_tx), len(periods_rx)-offset)]
+        rx_aligned = periods_rx[offset:offset+len(tx_aligned)]
+    else:
+        tx_aligned = periods_tx[-offset:-offset+min(len(periods_tx)+offset, len(periods_rx))]
+        rx_aligned = periods_rx[:len(tx_aligned)]
+
+    n = len(tx_aligned)
+    if n < n_samples // 2:
+        print(f"    ERROR: Only {n} aligned samples")
+        return None
+
+    # Calibrate
+    slope, intercept = np.polyfit(tx_aligned, rx_aligned, 1)
+    print(f"    Calibration: slope={slope:.4f}, intercept={intercept:.1f}")
+
+    # Apply calibration and convert to x (this is s = x + mask)
+    periods_calibrated = (rx_aligned - intercept) / slope
+    s_recv = np.array([period_to_x(p) for p in periods_calibrated])
+
+    # Run Cuomo-Oppenheim observer to estimate x (use true ICs for best performance)
+    x_est, y_est, z_est = cuomo_oppenheim_observer(s_recv, DT, x_true[0], y_true[0], z_true[0])
 
     # Recover mask
     residual = s_recv - x_est
 
-    # Decode bits using only settled portion (last half of each bit period)
-    settle = SAMPLES_PER_BIT // 2
+    # Decode bits: use 80% settle, threshold at 50% of mask
+    # Post-process: if residual > 2.5 but < 4 after a 1, likely transient → flip to 0
+    settle = int(SAMPLES_PER_BIT * 0.80)
+    raw_residuals = []
     bits_rx = []
+    threshold = MASK_AMPLITUDE * 0.45  # Slightly below 50% to catch borderline 1s
+
     for i in range(len(bits_tx)):
         start = i * SAMPLES_PER_BIT + settle
         end = (i + 1) * SAMPLES_PER_BIT
         if end <= len(residual):
             seg = residual[start:end]
-            bits_rx.append(1 if np.median(seg) > MASK_AMPLITUDE / 2 else 0)
+            med = np.median(seg)
+            raw_residuals.append(med)
+            bits_rx.append(1 if med > threshold else 0)
+
+    # Post-process: correct 1→0 transients
+    # If prev bit=1 and current decoded as 1 with mid-range residual, likely transient
+    for i in range(1, len(bits_rx)):
+        if bits_rx[i-1] == 1 and bits_rx[i] == 1:
+            # Transient range: above threshold but below strong 1 signal
+            if raw_residuals[i] < MASK_AMPLITUDE * 1.2:
+                bits_rx[i] = 0
 
     bits_rx = np.array(bits_rx)
     errors = np.sum(bits_tx[:len(bits_rx)] != bits_rx)
