@@ -2,8 +2,11 @@
 """
 Chaotic Synchronization and Communication over 433 MHz RF
 
-Demonstrates Pecora-Carroll synchronization using a Flipper Zero transmitter
-and RTL-SDR receiver on a Raspberry Pi 5.
+Demonstrates Pecora-Carroll synchronization and Cuomo-Oppenheim chaos masking
+using a Flipper Zero transmitter and RTL-SDR receiver on a Raspberry Pi 5.
+
+The modem transmits initial conditions (ICs) in a 24-period header, allowing
+the receiver to reconstruct the chaotic carrier and decode the masked message.
 
 Usage:
     python chaos_rf.py sync [n_samples]     # Synchronization experiment
@@ -150,6 +153,13 @@ X_MIN, X_MAX = -20.0, 20.0
 SAMPLES_PER_BIT = 50   # 50 samples/bit × 8 bits = 400 samples ≈ 4KB (at serial limit)
 MASK_AMPLITUDE = 3.0
 
+# IC header parameters (24 periods total for x, y, z at 8-bit precision each)
+IC_BITS = 8
+IC_HEADER_LEN = IC_BITS * 3
+IC_X_RANGE = (-20, 20)
+IC_Y_RANGE = (-30, 30)
+IC_Z_RANGE = (0, 50)
+
 
 def x_to_period(x):
     """Map Lorenz x value to pulse period in microseconds."""
@@ -165,12 +175,85 @@ def period_to_x(period):
     return X_MIN + x_norm * (X_MAX - X_MIN)
 
 
+def quantize_ic(value, ic_range):
+    """Quantize IC value to 8-bit integer."""
+    lo, hi = ic_range
+    clipped = np.clip(value, lo, hi)
+    norm = (clipped - lo) / (hi - lo)
+    return int(norm * 255)
+
+
+def dequantize_ic(quant, ic_range):
+    """Dequantize 8-bit integer back to IC value."""
+    lo, hi = ic_range
+    return lo + (quant / 255) * (hi - lo)
+
+
+def encode_ic_header(x0, y0, z0):
+    """Encode initial conditions as 24 periods (8 bits each for x, y, z).
+
+    bit=1 → PERIOD_MIN (short pulse)
+    bit=0 → PERIOD_MAX (long pulse)
+    """
+    x_quant = quantize_ic(x0, IC_X_RANGE)
+    y_quant = quantize_ic(y0, IC_Y_RANGE)
+    z_quant = quantize_ic(z0, IC_Z_RANGE)
+
+    periods = []
+    for quant in [x_quant, y_quant, z_quant]:
+        for i in range(7, -1, -1):
+            bit = (quant >> i) & 1
+            periods.append(PERIOD_MIN if bit == 1 else PERIOD_MAX)
+
+    return np.array(periods)
+
+
+def decode_ic_header(periods):
+    """Decode 24-period header back to initial conditions."""
+    quants = []
+    for ic_idx in range(3):
+        quant = 0
+        for i in range(8):
+            p = periods[ic_idx * 8 + i]
+            mid = (PERIOD_MIN + PERIOD_MAX) / 2
+            bit = 1 if p < mid else 0
+            quant = (quant << 1) | bit
+        quants.append(quant)
+
+    x0 = dequantize_ic(quants[0], IC_X_RANGE)
+    y0 = dequantize_ic(quants[1], IC_Y_RANGE)
+    z0 = dequantize_ic(quants[2], IC_Z_RANGE)
+
+    return x0, y0, z0
+
+
 def create_sub_file(x_values, filename=None):
     """Create Flipper .sub file from x trajectory."""
     pulses = []
     for x in x_values:
         p = x_to_period(x)
         pulses.extend([p // 2, -(p // 2)])
+
+    content = (
+        "Filetype: Flipper SubGhz RAW File\n"
+        "Version: 1\n"
+        "Frequency: 433920000\n"
+        "Preset: FuriHalSubGhzPresetOok650Async\n"
+        "Protocol: RAW\n"
+        "RAW_Data: " + " ".join(map(str, pulses)) + "\n"
+    )
+
+    if filename:
+        with open(filename, 'w') as f:
+            f.write(content)
+    return content
+
+
+def create_sub_file_from_periods(periods, filename=None):
+    """Create Flipper .sub file from raw period array."""
+    pulses = []
+    for p in periods:
+        pulses.extend([int(p) // 2, -(int(p) // 2)])
 
     content = (
         "Filetype: Flipper SubGhz RAW File\n"
@@ -492,7 +575,10 @@ def run_sync_experiment(n_samples=80):
 
 
 def run_modem_experiment(message="A"):
-    """Run chaos-masked communication experiment over RF."""
+    """Run chaos-masked communication experiment over RF.
+
+    Transmits a 24-period IC header followed by masked data.
+    """
     print("=" * 60)
     print("CHAOS MODEM OVER RF")
     print("=" * 60)
@@ -503,9 +589,9 @@ def run_modem_experiment(message="A"):
     print(f"Message: \"{message}\"")
     print(f"Bits: {list(bits_tx)}")
     print(f"Samples: {n_samples}, Mask amplitude: {MASK_AMPLITUDE}")
+    print(f"IC header: {IC_HEADER_LEN} periods")
 
     # Generate trajectory with warmup
-    # No fixed seed - real variability for each trial
     warmup = 1000
     total = warmup + n_samples
     t, traj = generate_trajectory(duration=total * DT, dt=DT)
@@ -513,7 +599,13 @@ def run_modem_experiment(message="A"):
     y_true = traj[warmup:warmup + n_samples, 1]
     z_true = traj[warmup:warmup + n_samples, 2]
 
+    # Get initial conditions for header
+    x0, y0, z0 = x_true[0], y_true[0], z_true[0]
     print(f"\n[1] Generated trajectory, x range [{x_true.min():.2f}, {x_true.max():.2f}]")
+    print(f"    ICs: x0={x0:.3f}, y0={y0:.3f}, z0={z0:.3f}")
+
+    # Encode IC header
+    header_periods = encode_ic_header(x0, y0, z0)
 
     # Add mask for bit=1
     mask = np.zeros(n_samples)
@@ -523,11 +615,18 @@ def run_modem_experiment(message="A"):
 
     x_masked = x_true + mask
 
+    # Encode data as periods
+    data_periods = np.array([x_to_period(x) for x in x_masked])
+
+    # Combine header + data
+    all_periods = np.concatenate([header_periods, data_periods])
+
     # Create and transmit
-    sub_content = create_sub_file(x_masked)
-    print("[2] Uploading to Flipper...")
-    print("[3] Starting SDR capture...")
-    print("[4] Transmitting...")
+    sub_content = create_sub_file_from_periods(all_periods)
+    print(f"[2] Total periods: {len(all_periods)} (header: {IC_HEADER_LEN}, data: {len(data_periods)})")
+    print("[3] Uploading to Flipper...")
+    print("[4] Starting SDR capture...")
+    print("[5] Transmitting...")
 
     capture_file = flipper_upload_and_tx(sub_content)
     if capture_file is None:
@@ -535,21 +634,18 @@ def run_modem_experiment(message="A"):
         return None
 
     # Analyze
-    print("[5] Analyzing...")
-    periods_rx, snr = extract_periods_from_capture(capture_file, n_samples)
+    print("[6] Analyzing...")
+    periods_rx, snr = extract_periods_from_capture(capture_file, len(all_periods))
     print(f"    SNR: {snr:.1f}")
 
     if periods_rx is None:
         print("    ERROR: No signal detected")
         return None
 
-    print(f"    Periods: {len(periods_rx)} (expected {n_samples})")
+    print(f"    Periods: {len(periods_rx)} (expected {len(all_periods)})")
 
-    # Compute expected TX periods for alignment
-    periods_tx = np.array([x_to_period(x) for x in x_masked])
-
-    # Find best alignment
-    offset, raw_corr = find_best_alignment(periods_tx, periods_rx)
+    # Find best alignment using full transmitted periods (header + data)
+    offset, raw_corr = find_best_alignment(all_periods, periods_rx)
     print(f"    Alignment: offset={offset}, raw_corr={raw_corr:.4f}")
 
     if raw_corr < 0.3:
@@ -558,14 +654,14 @@ def run_modem_experiment(message="A"):
 
     # Apply alignment
     if offset >= 0:
-        tx_aligned = periods_tx[:min(len(periods_tx), len(periods_rx)-offset)]
+        tx_aligned = all_periods[:min(len(all_periods), len(periods_rx)-offset)]
         rx_aligned = periods_rx[offset:offset+len(tx_aligned)]
     else:
-        tx_aligned = periods_tx[-offset:-offset+min(len(periods_tx)+offset, len(periods_rx))]
+        tx_aligned = all_periods[-offset:-offset+min(len(all_periods)+offset, len(periods_rx))]
         rx_aligned = periods_rx[:len(tx_aligned)]
 
     n = len(tx_aligned)
-    if n < n_samples // 2:
+    if n < IC_HEADER_LEN + n_samples // 2:
         print(f"    ERROR: Only {n} aligned samples")
         return None
 
@@ -573,12 +669,20 @@ def run_modem_experiment(message="A"):
     slope, intercept = np.polyfit(tx_aligned, rx_aligned, 1)
     print(f"    Calibration: slope={slope:.4f}, intercept={intercept:.1f}")
 
-    # Apply calibration and convert to x (this is s = x + mask)
+    # Apply calibration
     periods_calibrated = (rx_aligned - intercept) / slope
-    s_recv = np.array([period_to_x(p) for p in periods_calibrated])
 
-    # Run Cuomo-Oppenheim observer to estimate x (use true ICs for best performance)
-    x_est, y_est, z_est = cuomo_oppenheim_observer(s_recv, DT, x_true[0], y_true[0], z_true[0])
+    # Decode IC header (first 24 periods)
+    header_calibrated = periods_calibrated[:IC_HEADER_LEN]
+    x0_rx, y0_rx, z0_rx = decode_ic_header(header_calibrated)
+    print(f"    Decoded ICs: x0={x0_rx:.3f}, y0={y0_rx:.3f}, z0={z0_rx:.3f}")
+
+    # Extract data portion (after header)
+    data_calibrated = periods_calibrated[IC_HEADER_LEN:]
+    s_recv = np.array([period_to_x(p) for p in data_calibrated])
+
+    # Run Cuomo-Oppenheim observer with DECODED ICs from header
+    x_est, y_est, z_est = cuomo_oppenheim_observer(s_recv, DT, x0_rx, y0_rx, z0_rx)
 
     # Recover mask
     residual = s_recv - x_est
@@ -637,7 +741,10 @@ def run_modem_experiment(message="A"):
 
 
 def run_offline_test(message="A"):
-    """Test modem encoding/decoding without RF (simulation only)."""
+    """Test modem encoding/decoding without RF (simulation only).
+
+    Uses IC header just like the RF modem.
+    """
     print("=" * 60)
     print("OFFLINE MODEM TEST (no RF)")
     print("=" * 60)
@@ -647,12 +754,21 @@ def run_offline_test(message="A"):
 
     print(f"Message: \"{message}\" = {list(bits_tx)}")
     print(f"Samples: {n_samples}, Mask: {MASK_AMPLITUDE}")
+    print(f"IC header: {IC_HEADER_LEN} periods")
 
-    # Generate trajectory
-    np.random.seed(42)
+    # Generate trajectory with warmup
     warmup = 1000
     t, traj = generate_trajectory(duration=(warmup + n_samples) * DT, dt=DT)
     x_true = traj[warmup:warmup + n_samples, 0]
+    y_true = traj[warmup:warmup + n_samples, 1]
+    z_true = traj[warmup:warmup + n_samples, 2]
+
+    # Get ICs
+    x0, y0, z0 = x_true[0], y_true[0], z_true[0]
+    print(f"True ICs: x0={x0:.4f}, y0={y0:.4f}, z0={z0:.4f}")
+
+    # Encode IC header
+    header_periods = encode_ic_header(x0, y0, z0)
 
     # Add mask
     mask = np.zeros(n_samples)
@@ -662,44 +778,71 @@ def run_offline_test(message="A"):
 
     x_masked = x_true + mask
 
-    # Simulate period encoding/decoding (ideal channel)
-    periods = np.array([x_to_period(x) for x in x_masked])
-    s_recv = np.array([period_to_x(p) for p in periods])
+    # Encode data as periods
+    data_periods = np.array([x_to_period(x) for x in x_masked])
 
-    # Run observer
-    x_est, y_est, z_est = cuomo_oppenheim_observer(s_recv, DT)
+    # Combine header + data
+    all_periods = np.concatenate([header_periods, data_periods])
+
+    # Simulate perfect channel (no noise)
+    periods_rx = all_periods.copy()
+
+    # Decode IC header
+    x0_rx, y0_rx, z0_rx = decode_ic_header(periods_rx[:IC_HEADER_LEN])
+    print(f"Decoded ICs: x0={x0_rx:.4f}, y0={y0_rx:.4f}, z0={z0_rx:.4f}")
+    print(f"IC error: dx={x0_rx-x0:.3f}, dy={y0_rx-y0:.3f}, dz={z0_rx-z0:.3f}")
+
+    # Decode data
+    data_rx = periods_rx[IC_HEADER_LEN:]
+    s_recv = np.array([period_to_x(p) for p in data_rx])
+
+    # Run observer with DECODED ICs
+    x_est, y_est, z_est = cuomo_oppenheim_observer(s_recv, DT, x0_rx, y0_rx, z0_rx)
     residual = s_recv - x_est
 
-    # Decode using settled portion (last half of each bit)
-    settle = SAMPLES_PER_BIT // 2
+    # Decode using 80% settle, 0.45 threshold
+    settle = int(SAMPLES_PER_BIT * 0.80)
+    threshold = MASK_AMPLITUDE * 0.45
+    raw_residuals = []
     bits_rx = []
+
     for i in range(len(bits_tx)):
         start = i * SAMPLES_PER_BIT + settle
         end = (i + 1) * SAMPLES_PER_BIT
-        seg = residual[start:end]
-        bits_rx.append(1 if np.median(seg) > MASK_AMPLITUDE / 2 else 0)
+        if end <= len(residual):
+            seg = residual[start:end]
+            med = np.median(seg)
+            raw_residuals.append(med)
+            bits_rx.append(1 if med > threshold else 0)
+
+    # Post-process: correct 1→0 transients
+    for i in range(1, len(bits_rx)):
+        if bits_rx[i-1] == 1 and bits_rx[i] == 1:
+            if raw_residuals[i] < MASK_AMPLITUDE * 1.2:
+                bits_rx[i] = 0
 
     bits_rx = np.array(bits_rx)
-    errors = np.sum(bits_tx != bits_rx)
+    errors = np.sum(bits_tx[:len(bits_rx)] != bits_rx)
 
     # x reconstruction quality
-    x_corr = np.corrcoef(x_true, x_est)[0, 1]
+    x_corr = np.corrcoef(x_true[:len(s_recv)], x_est)[0, 1]
 
     print(f"\nx reconstruction correlation: {x_corr:.4f}")
     print(f"\nTX: {list(bits_tx)}")
     print(f"RX: {list(bits_rx)}")
     print(f"Errors: {errors}/{len(bits_tx)}")
 
-    # Per-bit
-    print("\nPer-bit analysis (settled portion):")
-    for i in range(len(bits_tx)):
-        start = i * SAMPLES_PER_BIT + settle
-        end = (i + 1) * SAMPLES_PER_BIT
-        seg = residual[start:end]
+    # Per-bit analysis
+    print("\nPer-bit analysis (80% settle):")
+    for i in range(min(len(bits_tx), len(bits_rx))):
         expected = MASK_AMPLITUDE if bits_tx[i] == 1 else 0
         status = "OK" if bits_tx[i] == bits_rx[i] else "ERR"
         print(f"  bit {i}: tx={bits_tx[i]} rx={bits_rx[i]} "
-              f"residual={np.median(seg):+.2f} expected={expected:.0f} [{status}]")
+              f"residual={raw_residuals[i]:+.2f} expected={expected:.0f} [{status}]")
+
+    if errors == 0:
+        decoded = bits_to_text(bits_rx)
+        print(f"\n*** DECODED: \"{decoded}\" ***")
 
 
 # =============================================================================
