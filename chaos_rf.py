@@ -147,7 +147,7 @@ PERIOD_MAX = 2000       # Maximum pulse period (microseconds)
 X_MIN, X_MAX = -20.0, 20.0
 
 # Modem parameters
-SAMPLES_PER_BIT = 30
+SAMPLES_PER_BIT = 150  # Reduced for faster upload (150 causes serial hang)
 MASK_AMPLITUDE = 3.0
 
 
@@ -219,7 +219,7 @@ SDR_RATE = 1000000
 SDR_GAIN = 40
 
 
-def flipper_upload_and_tx(sub_content, capture_duration=3.0):
+def flipper_upload_and_tx(sub_content, capture_duration=5.0):
     """Upload .sub file to Flipper and transmit while capturing with SDR.
 
     CRITICAL: Must call `loader close` before tx_from_file or it fails with
@@ -227,70 +227,80 @@ def flipper_upload_and_tx(sub_content, capture_duration=3.0):
 
     Returns path to capture file, or None on failure.
     """
+    import sys
     capture_file = '/tmp/chaos_capture.bin'
 
-    # Write .sub content to temp file
+    print("    [a] Writing temp file...", flush=True)
     with open('/tmp/chaos.sub', 'w') as f:
         f.write(sub_content)
 
-    ser = serial.Serial(FLIPPER_PORT, FLIPPER_BAUD, timeout=5)
+    print("    [b] Opening serial...", flush=True)
+    ser = serial.Serial(FLIPPER_PORT, FLIPPER_BAUD, timeout=2, write_timeout=2)
     time.sleep(0.3)
     ser.read(ser.in_waiting)
 
-    # CRITICAL: Close any open apps first
+    print("    [c] loader close...", flush=True)
     ser.write(b'loader close\r\n')
     time.sleep(0.2)
     ser.read(ser.in_waiting)
 
-    # Delete old file
+    print("    [d] storage remove...", flush=True)
     ser.write(b'storage remove /ext/subghz/chaos.sub\r\n')
     time.sleep(0.2)
     ser.read(ser.in_waiting)
 
-    # Upload new file via storage write
+    print("    [e] storage write...", flush=True)
     ser.write(b'storage write /ext/subghz/chaos.sub\r\n')
     time.sleep(0.2)
     ser.read(ser.in_waiting)
 
-    # Stream content in chunks
+    print(f"    [f] Sending {len(sub_content)} bytes...", flush=True)
     with open('/tmp/chaos.sub', 'r') as f:
         content = f.read()
     for i in range(0, len(content), 64):
         ser.write(content[i:i+64].encode())
         time.sleep(0.02)
 
-    # End with Ctrl+C
+    print("    [g] Ctrl+C to end write...", flush=True)
     ser.write(b'\x03')
     time.sleep(0.3)
     ser.read(ser.in_waiting)
 
-    # Close storage app that opened during write
+    print("    [h] loader close again...", flush=True)
     ser.write(b'loader close\r\n')
     time.sleep(0.2)
     ser.read(ser.in_waiting)
 
-    # Start SDR capture BEFORE transmitting
+    print("    [i] Starting SDR capture...", flush=True)
     n_samples = int(capture_duration * SDR_RATE)
     cap = subprocess.Popen(
         ['rtl_sdr', '-f', str(SDR_FREQ), '-s', str(SDR_RATE),
          '-g', str(SDR_GAIN), '-n', str(n_samples), capture_file],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
-    time.sleep(1.5)  # Let capture stabilize
+    time.sleep(1.5)
 
-    # Transmit
+    print("    [j] Transmitting...", flush=True)
     ser.write(b'subghz tx_from_file /ext/subghz/chaos.sub\r\n')
-    time.sleep(2)
+    time.sleep(3)
     response = ser.read(ser.in_waiting)
     ser.close()
+    print("    [k] TX done", flush=True)
 
-    # Check for TX error
     if b'cannot be run' in response:
         print("ERROR: Flipper TX blocked - app still open")
         cap.terminate()
         return None
 
-    cap.wait(timeout=10)
+    print("    [l] Waiting for capture...", flush=True)
+    try:
+        cap.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        print("ERROR: Capture timed out")
+        cap.kill()
+        return None
+
+    print("    [m] Done", flush=True)
     return capture_file
 
 
@@ -320,9 +330,9 @@ def extract_periods_from_capture(capture_file, expected_periods=None):
     if len(transitions) == 0:
         return None, snr
 
-    # Extract burst region
+    # Extract burst region (larger for 150 samples/bit transmissions)
     start = max(0, transitions[0] - 1000)
-    burst = mag[start:start + 500000]
+    burst = mag[start:start + 2000000]
 
     # Fine envelope for pulse edges
     fine_env = uniform_filter1d(burst, 100)
@@ -471,10 +481,11 @@ def run_modem_experiment(message="A"):
     # Recover mask
     residual = s_recv - x_est
 
-    # Decode bits
+    # Decode bits using only settled portion (last half of each bit period)
+    settle = SAMPLES_PER_BIT // 2
     bits_rx = []
     for i in range(len(bits_tx)):
-        start = i * SAMPLES_PER_BIT
+        start = i * SAMPLES_PER_BIT + settle
         end = (i + 1) * SAMPLES_PER_BIT
         if end <= len(residual):
             seg = residual[start:end]
@@ -491,9 +502,9 @@ def run_modem_experiment(message="A"):
     print(f"Bit errors: {errors}/{len(bits_rx)}")
 
     # Per-bit analysis
-    print("\nPer-bit residuals:")
+    print("\nPer-bit residuals (settled portion):")
     for i in range(min(len(bits_tx), len(bits_rx))):
-        start = i * SAMPLES_PER_BIT
+        start = i * SAMPLES_PER_BIT + settle
         end = min((i + 1) * SAMPLES_PER_BIT, len(residual))
         if end > start:
             seg = residual[start:end]
@@ -543,10 +554,13 @@ def run_offline_test(message="A"):
     x_est, y_est, z_est = cuomo_oppenheim_observer(s_recv, DT)
     residual = s_recv - x_est
 
-    # Decode
+    # Decode using settled portion (last half of each bit)
+    settle = SAMPLES_PER_BIT // 2
     bits_rx = []
     for i in range(len(bits_tx)):
-        seg = residual[i * SAMPLES_PER_BIT:(i + 1) * SAMPLES_PER_BIT]
+        start = i * SAMPLES_PER_BIT + settle
+        end = (i + 1) * SAMPLES_PER_BIT
+        seg = residual[start:end]
         bits_rx.append(1 if np.median(seg) > MASK_AMPLITUDE / 2 else 0)
 
     bits_rx = np.array(bits_rx)
@@ -561,9 +575,11 @@ def run_offline_test(message="A"):
     print(f"Errors: {errors}/{len(bits_tx)}")
 
     # Per-bit
-    print("\nPer-bit analysis:")
+    print("\nPer-bit analysis (settled portion):")
     for i in range(len(bits_tx)):
-        seg = residual[i * SAMPLES_PER_BIT:(i + 1) * SAMPLES_PER_BIT]
+        start = i * SAMPLES_PER_BIT + settle
+        end = (i + 1) * SAMPLES_PER_BIT
+        seg = residual[start:end]
         expected = MASK_AMPLITUDE if bits_tx[i] == 1 else 0
         status = "OK" if bits_tx[i] == bits_rx[i] else "ERR"
         print(f"  bit {i}: tx={bits_tx[i]} rx={bits_rx[i]} "
