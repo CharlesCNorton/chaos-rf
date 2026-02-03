@@ -6,33 +6,33 @@ Chaotic synchronization and communication over 433 MHz RF using Flipper Zero + R
 
 Transmits one variable (x) of a Lorenz attractor over RF. The receiver reconstructs the other two variables (y, z) using Pecora-Carroll synchronization. Binary data can be hidden in the chaotic carrier using Cuomo-Oppenheim masking.
 
-## Results
+## Statistical Results (N=30 trials)
 
-### Synchronization
+### Channel Reliability
 | Metric | Value |
 |--------|-------|
-| x recovery | 0.956 |
-| y sync | 0.997 |
-| z sync | 0.959 |
+| Success rate | 40% |
+| Failure mode | Poor alignment (raw_corr < 0.5) |
 
-### Modem (150 samples/bit)
-| Metric | Value |
-|--------|-------|
-| Bit errors | 0/8 |
-| SNR | 30 |
+### Synchronization (successful trials, 95% CI)
+| Metric | Mean | 95% CI |
+|--------|------|--------|
+| x recovery | 0.514 | [0.458, 0.571] |
+| y sync | 0.911 | [0.868, 0.953] |
+| z sync | 0.960 | [0.943, 0.978] |
 
 ## Hardware
 
-- Raspberry Pi 5 (eco mode required for dual USB)
+- Raspberry Pi 5 (eco mode required for dual USB power)
 - Flipper Zero (CC1101, 433.92 MHz)
-- RTL-SDR (R820T, gain=40)
+- RTL-SDR (R820T, gain=30, 1 MHz sample rate)
 
 Both devices on the Pi via USB within a few meters of each other.
 
 ## Usage
 
 ```bash
-python3 chaos_rf.py sync 50      # Sync experiment
+python3 chaos_rf.py sync 80      # Sync experiment (80 samples)
 python3 chaos_rf.py modem A      # Send 'A' over RF
 python3 chaos_rf.py test         # Offline test
 ```
@@ -41,30 +41,46 @@ python3 chaos_rf.py test         # Offline test
 
 **Lorenz system:**
 ```
-dx/dt = σ(y - x)
-dy/dt = x(ρ - z) - y
-dz/dt = xy - βz
+dx/dt = sigma*(y - x)
+dy/dt = x*(rho - z) - y
+dz/dt = x*y - beta*z
 ```
 
-**Pecora-Carroll sync:** Transmit x(t). Receiver integrates y,z driven by received x. After transient, receiver's y,z converge to transmitter's y,z.
+**Pecora-Carroll sync:** Transmit x(t). Receiver integrates y,z driven by received x. After transient (~15 samples), receiver's y,z converge to transmitter's y,z.
 
 **Cuomo-Oppenheim masking:** Add offset m to x for bit=1. Receiver runs observer where x evolves via natural dynamics (filtering the mask) while y,z are driven by s=x+m. Recover m = s - x_est.
 
-**Key parameter:** 150 samples/bit (0.75 Lorenz time = 7.5 time constants) allows observer to settle between bits.
+## Critical Implementation Details
+
+### Period Extraction
+- Use 450-sample smoothing window (not 100 or 200)
+- Smaller windows detect carrier oscillations, not pulse envelope
+- This is the most common source of errors
+
+### Alignment
+- TX and RX period sequences may be offset by several samples
+- Use cross-correlation to find best alignment before calibration
+- Reject trials with raw_corr < 0.5
+
+### Transient
+- Skip first 15 samples when computing sync correlations
+- The receiver y,z subsystem needs time to converge to attractor
+
+### Initial Conditions
+- Use true y[0], z[0] for sync (not arbitrary values)
+- With random ICs, y sync drops from 0.91 to ~0.80
 
 ## Flipper Serial Notes
 
 Large uploads (>10KB) require:
-- 16-byte chunks
-- 100ms delays between chunks
-- Periodic buffer drain
+- 64-byte chunks
+- 20ms delays between chunks
 - `loader close` before `tx_from_file`
-- USB reset between experiments
 
 ## References
 
-- Pecora & Carroll, PRL 1990
-- Cuomo & Oppenheim, PRL 1993
+- Pecora & Carroll, "Synchronization in Chaotic Systems", PRL 1990
+- Cuomo & Oppenheim, "Circuit Implementation of Synchronized Chaos", PRL 1993
 
 ## License
 
